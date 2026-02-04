@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canvas2toml"
+version = "0.1.0"
+description = "Python library to convert Canvas assignments to TOML.  Includes command line tool canvas2toml."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Dustin Kleckner" }]
+license = { file = "LICENSE" }
+dependencies = [
+    "requests>=2.31",
+    "tomli>=2.0; python_version<'3.11'",
+    "markdownify>=0.12",
+    "markdown>=3.5",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+canvas2toml = "canvas2toml.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
