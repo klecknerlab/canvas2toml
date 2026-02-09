@@ -30,11 +30,14 @@ Common commands (and options):
 
 - `canvas2toml get assignments [-o FILE] [-a/--anon]`
   - Prompts you to pick an assignment, asks whether to download PDF submissions (default Y).
-  - Saves PDFs as `<assignment_title>_<studentid>.pdf` in `<output_stem>_submissions/`.
-  - Generates a TOML with `grading_info`, assignment metadata, and sorted `[[submission]]` blocks containing ids, optional names (omitted with `--anon`), current scores, latest comments (converted to HTML), and `file` pointers to downloaded PDFs.
+  - PDFs: saves as `<assignment_title>_<studentid>.pdf` in `<output_stem>_submissions/`; by default skips files that already exist and reports `downloaded X, skipped existing Y`. Use `--force-download-pdfs` to re-download everything.
+  - TOML includes `grading_info`, assignment metadata (with `due_at` when available), and sorted `[[submission]]` blocks containing ids, optional names (omitted with `--anon`), current scores, latest comments (converted to HTML), optional `file` pointers to PDFs, and timing fields when provided by Canvas:
+    - `submitted_at` (raw timestamp from Canvas)
+    - `days_late` (fractional days late, two decimals; only present if submitted after `due_at`)
 
 - `canvas2toml get quiz [-o FILE]`
   - Prompts for a quiz, downloads responses, and writes TOML including both `assignment_id` and `quiz_id` (useful for New Quizzes).
+  - Adds `due_at`, per-student `submitted_at`, and `days_late` (two decimal days when after due time) when present in the Student Analysis report.
 
 - `canvas2toml upload INPUT.toml`
   - Uploads `score` and `comment`/`comments` from each `[[submission]]`.

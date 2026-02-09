@@ -7,6 +7,8 @@ from collections.abc import Iterable
 import time
 import csv
 import re
+import math
+import datetime as dt
 import requests
 from urllib.parse import quote
 
@@ -33,6 +35,7 @@ def parse_quiz_csv(csv_bytes):
     name_col = None
     id_col = None
     sis_id_col = None
+    submitted_col = None
     q_col = []
     q_prompts = []
     max_points = []
@@ -47,6 +50,8 @@ def parse_quiz_csv(csv_bytes):
             id_col = i
         elif col_name == "sis_id":
             sis_id_col = i
+        elif col_name == "submitted":
+            submitted_col = i
         else:
             m = re.match(r"^\d+:\s+(.*)", col_name)
             if m: # question column
@@ -57,6 +62,7 @@ def parse_quiz_csv(csv_bytes):
     names = []  
     ids = []
     sis_ids = []
+    submitted = []
     answers = [[] for i in range(len(q_col))]
     points = [[] for i in range(len(q_col))]
     
@@ -64,6 +70,7 @@ def parse_quiz_csv(csv_bytes):
         names.append(row[name_col])
         ids.append(row[id_col])
         sis_ids.append(row[sis_id_col])
+        submitted.append(row[submitted_col] if submitted_col is not None else "")
         for i, q in enumerate(q_col):
             answers[i].append(row[q])
             points[i].append(try_int(row[q+1]))
@@ -77,7 +84,8 @@ def parse_quiz_csv(csv_bytes):
         "questions": q_prompts,
         "answers": answers,
         "points": points,
-        "max_points": max_points
+        "max_points": max_points,
+        "submitted": submitted,
     }
     
 import textwrap
@@ -120,7 +128,10 @@ def generate_quiz_toml(quiz_info, student_analysis, prepend_info = {}):
         
     if 'description' in quiz_info:
         tout += f"description = {toml_string(md(quiz_info['description']))}\n"
-        
+
+    if 'due_at' in quiz_info and quiz_info['due_at']:
+        tout += f"due_at = {toml_string(quiz_info['due_at'])}\n"
+
     tout += "\n"
     
     for key, value in prepend_info.items():
@@ -137,9 +148,29 @@ q{qn+1}_max_points = {student_analysis['max_points'][qn]}
     sis_ids = student_analysis['sis_ids']
     answers = student_analysis['answers']
     points = student_analysis['points']
+    submitted = student_analysis.get('submitted') or []
     
     lf_names = [name_lf(n) for n in names]
     order = sorted(range(len(names)), key=lambda i: lf_names[i])
+
+    due_at_raw = quiz_info.get('due_at')
+    due_at_dt = None
+    if due_at_raw:
+        try:
+            # Canvas times are ISO8601; ensure we have an offset-aware datetime.
+            due_at_dt = dt.datetime.fromisoformat(str(due_at_raw).replace("Z", "+00:00"))
+        except Exception:
+            due_at_dt = None
+
+    def _parse_submitted(raw):
+        if not raw:
+            return None
+        # Canvas CSV gives e.g. "2026-01-26 05:45:45 UTC".
+        try:
+            iso_like = str(raw).replace(" UTC", "+00:00")
+            return dt.datetime.fromisoformat(iso_like)
+        except Exception:
+            return None
 
     for i in order:
         tout += f"""
@@ -149,6 +180,17 @@ id = {ids[i]}
 sis_id = {sis_ids[i]}
 
 """
+        submitted_at_raw = submitted[i] if i < len(submitted) else ""
+        submitted_dt = _parse_submitted(submitted_at_raw)
+        if submitted_at_raw:
+            tout += f"submitted_at = {toml_string(submitted_at_raw)}\n"
+
+        if due_at_dt and submitted_dt:
+            delta = submitted_dt - due_at_dt
+            if delta.total_seconds() > 0:
+                days_late = round(delta.total_seconds() / 86400, 2)
+                tout += f"days_late = {days_late:.2f}\n"
+
         for qn, (ans, pts) in enumerate(zip(answers, points)):
             tout += f"q{qn+1}_answer = {toml_string(ans[i])}\n"
             if pts:

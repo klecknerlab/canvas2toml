@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import re
 import sys
 import textwrap
@@ -108,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Remove student names from generated TOML.",
     )
+    assignments_parser.add_argument(
+        "--force-download-pdfs",
+        action="store_true",
+        help="Re-download PDFs even if the file already exists (default skips existing).",
+    )
     assignments_parser.set_defaults(func=cmd_get_assignments)
 
     quiz_parser = get_subparsers.add_parser(
@@ -205,6 +211,21 @@ def _current_score_and_comment(sub: dict) -> tuple[float | int | None, str | Non
     return score, comment_text
 
 
+def _has_identical_comment(previous: dict, new_comment: str | None) -> bool:
+    """Return True if any existing submission comment matches the new one."""
+    if not new_comment:
+        return False
+    new_clean = str(new_comment).strip()
+    if not new_clean:
+        return False
+    comments = previous.get("submission_comments") or []
+    for item in comments:
+        text = item.get("comment") or item.get("text_comment")
+        if text and str(text).strip() == new_clean:
+            return True
+    return False
+
+
 def _triple(s: str | None, *, blank_line: bool = False) -> str:
     """Return TOML triple-quoted string literal for the given text (empty allowed).
 
@@ -262,6 +283,8 @@ def _submission_block(
     score=None,
     comment=None,
     anon: bool = False,
+    submitted_at: str | None = None,
+    days_late: int | None = None,
 ) -> str:
     """Create a TOML submission block with placeholders for scoring."""
     parts: list[str] = ["", "[[submission]]"]
@@ -282,6 +305,10 @@ def _submission_block(
         parts.append(f"sis_id = {toml_string(str(sis_id))}")
     if file_rel:
         parts.append(f'file = "{file_rel}"')
+    if submitted_at:
+        parts.append(f"submitted_at = {toml_string(str(submitted_at))}")
+    if days_late is not None:
+        parts.append(f"days_late = {days_late:.2f}")
     if score is None:
         parts.append("score = 0")
     else:
@@ -436,6 +463,9 @@ def cmd_upload(args: argparse.Namespace) -> int:
             attempt = previous.get("attempt") if isinstance(previous, dict) else None
             comment_text_raw = None if comment is None else str(comment).rstrip()
             comment_text = _markdown_to_html(comment_text_raw)
+            # Avoid reposting an identical comment.
+            if _has_identical_comment(previous, comment_text_raw):
+                comment_text = None
             course.update_submission(
                 assignment_id,
                 resolved_user_id,
@@ -453,6 +483,9 @@ def cmd_upload(args: argparse.Namespace) -> int:
                     )
                 except Exception as exc:
                     print(f"Warning: comment not posted for user {resolved_user_id}: {exc}")
+            else:
+                if comment_text_raw:
+                    print(f"Skipped duplicate comment for user {resolved_user_id}")
             processed += 1
             print(f"[{processed}/{valid_count}] Updated user {resolved_user_id}")
         except Exception as exc:  # pragma: no cover - show progress during batch
@@ -574,8 +607,19 @@ def cmd_get_assignments(args: argparse.Namespace) -> int:
 
     submissions_dir = out_path.parent / f"{out_path.stem}_submissions"
     submissions = course.get_submissions(choice.get("id"))
+    skip_existing_pdfs = not args.force_download_pdfs
+
+    due_at_raw = choice.get("due_at")
+    due_at_dt = None
+    if due_at_raw:
+        try:
+            due_at_dt = dt.datetime.fromisoformat(str(due_at_raw).replace("Z", "+00:00"))
+        except Exception:
+            pass
 
     file_map: dict[str, str] = {}
+    downloaded_count = 0
+    existing_count = 0
     if download_pdfs:
         for sub in submissions:
             attachments = sub.get("attachments") or []
@@ -601,12 +645,21 @@ def cmd_get_assignments(args: argparse.Namespace) -> int:
                 hw_part = _safe_filename(title)
                 safe_fname = f"{hw_part}_{sid_part}.pdf"
                 dest = submissions_dir / safe_fname
+                if skip_existing_pdfs and dest.exists():
+                    existing_count += 1
+                    file_map[str(sub.get("user_id") or sub.get("id") or "")] = dest.name
+                    break  # only first PDF per submission
                 try:
                     course.download_file(url, dest)
                     file_map[str(sub.get("user_id") or sub.get("id") or "")] = dest.name
+                    downloaded_count += 1
                     break  # only first PDF per submission
                 except Exception as exc:  # pragma: no cover
                     print(f"Failed to download {fname}: {exc}")
+        if downloaded_count or existing_count:
+            print(
+                f"PDFs: downloaded {downloaded_count}, skipped existing {existing_count}"
+            )
 
     # Sort submissions for deterministic TOML output (by name then id).
     def _sort_key(sub):
@@ -631,6 +684,12 @@ def cmd_get_assignments(args: argparse.Namespace) -> int:
                 score=score,
                 comment=comment,
                 anon=args.anon,
+                submitted_at=sub.get("submitted_at"),
+                days_late=(
+                    round((dt.datetime.fromisoformat(str(sub.get("submitted_at")).replace("Z", "+00:00")) - due_at_dt).total_seconds() / 86400, 2)
+                    if due_at_dt and sub.get("submitted_at") and dt.datetime.fromisoformat(str(sub.get("submitted_at")).replace("Z", "+00:00")) > due_at_dt
+                    else None
+                ),
             )
         )
 
