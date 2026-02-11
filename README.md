@@ -46,6 +46,8 @@ Common commands (and options):
 
 - `canvas2toml hist INPUT.toml -o DIR`
   - Builds PNG histograms for total `score` and per-question `qN_points` fields into a single `<input_stem>_hist.png` (plus console messages). Requires optional `matplotlib` (`pip install matplotlib`).
+- `canvas2toml report INPUT.toml [-o FILE]`
+  - Creates a standalone HTML report with an embedded score histogram (base64 PNG) and per-student sections showing name/id, score, and comments (Markdown converted to HTML). Defaults output to `<input_stem>_report.html`.
 
 - `canvas2toml help` (or no args): show help.
 

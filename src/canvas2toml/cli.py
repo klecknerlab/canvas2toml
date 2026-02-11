@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
+import io
 import json
 import math
 import re
@@ -139,6 +141,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hist_parser.set_defaults(func=cmd_hist)
 
+    # report -----------------------------------------------------------
+    report_parser = subparsers.add_parser(
+        "report",
+        help=(
+            "Generate an HTML report with a score histogram and per-student "
+            "scores/comments."
+        ),
+    )
+    report_parser.add_argument(
+        "input",
+        help="Path to graded TOML file with [[submission]] entries.",
+    )
+    report_parser.add_argument(
+        "-o",
+        "--output",
+        help="Output HTML file (default: <input_stem>_report.html).",
+    )
+    report_parser.set_defaults(func=cmd_report)
+
     # Default to help when no command is provided.
     parser.set_defaults(func=lambda args: parser.print_help())
     return parser
@@ -266,14 +287,25 @@ def _markdown_to_html(text: str | None) -> str | None:
     """Convert Markdown to HTML if possible; fall back to original text."""
     if text is None:
         return None
+    # Normalize common four-space-indented bullets (otherwise Markdown treats them as code blocks).
+    raw = str(text)
+    lines = raw.splitlines()
+    if any(re.match(r"^ {4,}- ", line) for line in lines):
+        lines = [line[4:] if line.startswith("    ") else line for line in lines]
+        raw = "\n".join(lines)
     try:
         import markdown  # type: ignore
     except Exception:
-        return str(text)
+        return raw
     try:
-        return markdown.markdown(str(text))
+        # Use the same options for all conversions (including uploads and reports).
+        return markdown.markdown(
+            raw,
+            extensions=["extra", "sane_lists", "nl2br"],
+            output_format="html5",
+        )
     except Exception:
-        return str(text)
+        return raw
 
 
 def _submission_block(
@@ -329,6 +361,15 @@ def _load_toml(path: Path) -> dict:
 
 def _timestamp() -> str:
     return dt.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
+
+
+def _to_float(val):
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val)
+    try:
+        return float(str(val))
+    except Exception:
+        return None
 
 
 def _write_backup_header(path: Path, data: dict) -> None:
@@ -515,14 +556,6 @@ def cmd_hist(args: argparse.Namespace) -> int:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    def _to_float(val):
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            return float(val)
-        try:
-            return float(str(val))
-        except Exception:
-            return None
-
     # Total score histogram
     scores = [_to_float(sub.get("score")) for sub in submissions]
     scores = [s for s in scores if s is not None]
@@ -582,6 +615,108 @@ def cmd_hist(args: argparse.Namespace) -> int:
     plt.close(fig)
     print(f"Wrote {out_file}")
 
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Generate a standalone HTML report with histogram and per-student sections."""
+    data = _load_toml(Path(args.input))
+    submissions = data.get("submission") or []
+    if not submissions:
+        print("No submissions found in the TOML file.")
+        return 1
+
+    title = data.get("title") or Path(args.input).stem
+
+    # Histogram image (base64 data URI)
+    histogram_uri = None
+    scores = [_to_float(sub.get("score")) for sub in submissions]
+    scores = [s for s in scores if s is not None]
+    if scores:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception as exc:  # pragma: no cover - optional dependency
+            print(
+                "matplotlib is required for the histogram. Install with 'pip install matplotlib'."
+            )
+            print(f"Import error: {exc}")
+            return 1
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(scores, bins="auto", edgecolor="black", color="#4a90e2")
+        ax.set_title("Score Histogram")
+        ax.set_xlabel("Score")
+        ax.set_ylabel("Count")
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        histogram_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(
+            "ascii"
+        )
+    else:
+        print("No numeric 'score' values found; histogram will be omitted.")
+
+    # Build HTML
+    def _student_label(sub: dict) -> str:
+        return (
+            sub.get("name")
+            or str(sub.get("id") or sub.get("sis_id") or "Unknown Student"))
+
+    sorted_subs = sorted(submissions, key=lambda s: _student_label(s).lower())
+
+    html_parts: list[str] = [
+        "<!DOCTYPE html>",
+        "<html>",
+        "<head>",
+        '<meta charset="utf-8">',
+        f"<title>{title}</title>",
+        "<style>",
+        "body { margin: 1.5rem auto; max-width: 960px; }",
+        ".student { margin: 1rem 0; padding: 1rem; border: 1px solid #ddd; border-radius: 8px; }",
+        "ul, ol { padding-left: 1.4em; }",
+        "</style>",
+        "</head>",
+        "<body>",
+        f"<h1>{title}</h1>",
+    ]
+
+    if histogram_uri:
+        html_parts.extend(
+            [
+                '<div class="histogram">',
+                f'<img src="{histogram_uri}" alt="Score histogram" style="max-width:100%; height:auto;">',
+                "</div>",
+            ]
+        )
+
+    for sub in sorted_subs:
+        label = _student_label(sub)
+        score = sub.get("score")
+        comment_raw = sub.get("comment", sub.get("comments"))
+        comment_html = _markdown_to_html(comment_raw) or "<em>No comment</em>"
+        score_text = "—" if score is None else score
+        html_parts.extend(
+            [
+                '<section class="student">',
+                f"<h2>{label}</h2>",
+                f'<p class="score">Score: {score_text}</p>',
+                f'<div class="comment">{comment_html}</div>',
+                "</section>",
+            ]
+        )
+
+    html_parts.extend(["</body>", "</html>"])
+
+    out_path = (
+        Path(args.output)
+        if args.output
+        else Path(args.input).with_name(f"{Path(args.input).stem}_report.html")
+    )
+    out_path.write_text("\n".join(html_parts), encoding="utf-8")
+    print(f"Wrote report to {out_path}")
     return 0
 
 
@@ -661,12 +796,13 @@ def cmd_get_assignments(args: argparse.Namespace) -> int:
                 f"PDFs: downloaded {downloaded_count}, skipped existing {existing_count}"
             )
 
-    # Sort submissions for deterministic TOML output (by name then id).
+    # Sort submissions for deterministic TOML output.
+    # When anonymizing, sort strictly by id to avoid leaking name order; otherwise name+id.
     def _sort_key(sub):
         user = sub.get("user") or {}
         name = sub.get("name") or user.get("name") or ""
         uid = str(sub.get("user_id") or sub.get("id") or "")
-        return (name.lower(), uid)
+        return (uid,) if args.anon else (name.lower(), uid)
 
     sorted_subs = sorted(submissions, key=_sort_key)
 
