@@ -97,6 +97,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     upload_parser.set_defaults(func=cmd_upload)
 
+    # update ------------------------------------------------------------
+    update_parser = subparsers.add_parser(
+        "update",
+        help=(
+            "Fetch any submissions not yet in an existing assignment TOML file "
+            "and prepend them."
+        ),
+    )
+    update_parser.add_argument(
+        "input",
+        help="Path to an existing assignment TOML file (must contain assignment_id).",
+    )
+    update_parser.add_argument(
+        "--force-download-pdfs",
+        action="store_true",
+        help="Re-download PDFs even if the file already exists (default skips existing).",
+    )
+    update_parser.set_defaults(func=cmd_get_update)
+
     # get ---------------------------------------------------------------
     get_parser = subparsers.add_parser("get", help="Fetch data from Canvas.")
     get_subparsers = get_parser.add_subparsers(dest="get_target")
@@ -415,6 +434,48 @@ def _append_backup_submission(path: Path, submission: dict, previous: dict) -> N
             fh.write(f"previous_comment = {toml_string(prev_comment)}\n")
 
 
+def _compute_late_deduction(
+    data: dict, submission: dict
+) -> tuple[float, str] | tuple[None, None]:
+    """Return (deduction_points, comment_suffix) if a late penalty applies, else (None, None).
+
+    Reads ``max_days_late`` and ``deduction_percent_per_day`` from *data* (the
+    top-level assignment dict).  ``days_late`` is taken from *submission*.
+
+    - ``days_late`` is rounded to the nearest 0.1 days before the calculation.
+    - Days used in the calculation are capped at ``max_days_late``.
+    - The deduction is expressed as a fraction of ``points_possible`` and
+      rounded to the nearest 0.1 points.
+    """
+    max_days_late = _to_float(data.get("max_days_late"))
+    deduction_pct_per_day = _to_float(data.get("deduction_percent_per_day"))
+    if max_days_late is None or deduction_pct_per_day is None:
+        return None, None
+
+    days_late_raw = _to_float(submission.get("days_late"))
+    if days_late_raw is None or days_late_raw <= 0:
+        return None, None
+
+    # Round days_late to nearest 0.1 and cap at max_days_late.
+    days_late = round(days_late_raw, 1)
+    days_used = min(days_late, max_days_late)
+
+    deduction_pct = days_used * deduction_pct_per_day
+
+    points_possible = _to_float(data.get("points_possible"))
+    if points_possible is None or points_possible <= 0:
+        return None, None
+
+    deduction_points = round(points_possible * deduction_pct / 100, 1)
+
+    comment_suffix = (
+        f"\n\n*Late penalty: {days_late} day(s) "
+        f"× {deduction_pct_per_day}%/day = {deduction_pct:.1f}% "
+        f"= −{deduction_points} point(s)*"
+    )
+    return deduction_points, comment_suffix
+
+
 def _count_valid_submissions(submissions: list[dict]) -> int:
     return sum(
         1
@@ -493,6 +554,17 @@ def cmd_upload(args: argparse.Namespace) -> int:
         if user_ref is None or (score is None and comment is None):
             continue
 
+        # Apply late deduction (does not modify the source TOML).
+        deduction_points, deduction_suffix = _compute_late_deduction(data, submission)
+        upload_score = score
+        if deduction_points is not None and score is not None:
+            score_f = _to_float(score)
+            if score_f is not None:
+                upload_score = round(max(0.0, score_f - deduction_points), 1)
+        upload_comment = comment
+        if deduction_suffix is not None:
+            upload_comment = (comment or "").rstrip() + deduction_suffix
+
         try:
             if user_ref in resolved_cache:
                 resolved_user_id = resolved_cache[user_ref]
@@ -502,7 +574,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
             previous = course.get_submission(assignment_id, resolved_user_id)
             _append_backup_submission(backup_path, submission, previous)
             attempt = previous.get("attempt") if isinstance(previous, dict) else None
-            comment_text_raw = None if comment is None else str(comment).rstrip()
+            comment_text_raw = None if upload_comment is None else str(upload_comment).rstrip()
             comment_text = _markdown_to_html(comment_text_raw)
             # Avoid reposting an identical comment.
             if _has_identical_comment(previous, comment_text_raw):
@@ -510,7 +582,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
             course.update_submission(
                 assignment_id,
                 resolved_user_id,
-                score=score,
+                score=upload_score,
                 comment=comment_text,
                 attempt=attempt,
             )
@@ -696,8 +768,20 @@ def cmd_report(args: argparse.Namespace) -> int:
         label = _student_label(sub)
         score = sub.get("score")
         comment_raw = sub.get("comment", sub.get("comments"))
-        comment_html = _markdown_to_html(comment_raw) or "<em>No comment</em>"
-        score_text = "—" if score is None else score
+
+        # Apply late deduction (does not modify the source TOML).
+        deduction_points, deduction_suffix = _compute_late_deduction(data, sub)
+        display_score = score
+        if deduction_points is not None and score is not None:
+            score_f = _to_float(score)
+            if score_f is not None:
+                display_score = round(max(0.0, score_f - deduction_points), 1)
+        display_comment = comment_raw
+        if deduction_suffix is not None:
+            display_comment = (comment_raw or "").rstrip() + deduction_suffix
+
+        comment_html = _markdown_to_html(display_comment) or "<em>No comment</em>"
+        score_text = "—" if display_score is None else display_score
         html_parts.extend(
             [
                 '<section class="student">',
@@ -756,6 +840,19 @@ def cmd_get_assignments(args: argparse.Namespace) -> int:
     downloaded_count = 0
     existing_count = 0
     if download_pdfs:
+        # Count how many PDFs we expect to handle for a simple progress indicator.
+        pdf_total = 0
+        for sub in submissions:
+            attachments = sub.get("attachments") or []
+            for att in attachments:
+                fname = att.get("filename") or att.get("display_name")
+                if fname and fname.lower().endswith(".pdf") and (
+                    att.get("url") or att.get("download_url") or att.get("href")
+                ):
+                    pdf_total += 1
+                    break  # only first PDF per submission counts toward progress
+
+        pdf_seen = 0
         for sub in submissions:
             attachments = sub.get("attachments") or []
             if not attachments:
@@ -776,10 +873,13 @@ def cmd_get_assignments(args: argparse.Namespace) -> int:
                 url = att.get("url") or att.get("download_url") or att.get("href")
                 if not url:
                     continue
+                pdf_seen += 1
                 sid_part = _safe_filename(str(student_id)) if student_id else _safe_filename(student_name)
                 hw_part = _safe_filename(title)
                 safe_fname = f"{hw_part}_{sid_part}.pdf"
                 dest = submissions_dir / safe_fname
+                if pdf_total:
+                    print(f"[{pdf_seen}/{pdf_total}] {safe_fname}")
                 if skip_existing_pdfs and dest.exists():
                     existing_count += 1
                     file_map[str(sub.get("user_id") or sub.get("id") or "")] = dest.name
@@ -833,6 +933,167 @@ def cmd_get_assignments(args: argparse.Namespace) -> int:
     print(f"Saved assignment to {out_path}")
     if submissions_dir.exists():
         print(f"Downloaded PDFs to {submissions_dir}")
+    return 0
+
+
+def cmd_get_update(args: argparse.Namespace) -> int:
+    """Fetch any missing submissions from Canvas and prepend them to an existing TOML file."""
+    course = _validate_course(args.course)
+    if course is None:
+        return 1
+
+    input_path = Path(args.input)
+    if not input_path.is_file():
+        print(f"Input TOML not found: {input_path}")
+        return 1
+
+    data = _load_toml(input_path)
+    assignment_id = data.get("assignment_id")
+    if assignment_id is None:
+        print("assignment_id is required in the TOML file.")
+        return 1
+
+    # Parse due_at if available (used only to populate days_late on new blocks).
+    due_at_dt = None
+    due_at_raw = data.get("due_at")
+    if due_at_raw:
+        try:
+            due_at_dt = dt.datetime.fromisoformat(str(due_at_raw).replace("Z", "+00:00"))
+        except Exception:
+            pass
+
+    # Detect whether the original download was anonymized (no name fields present).
+    existing_subs = data.get("submission") or []
+    anon = not any(sub.get("name") for sub in existing_subs)
+
+    # Build lookup sets from TOML submissions that already have a file — those
+    # are considered done and must not be touched.  Match on both numeric id and
+    # sis_id so the check is robust regardless of which field Canvas returns.
+    existing_ids: set[str] = set()
+    existing_sis_ids: set[str] = set()
+    for sub in existing_subs:
+        if sub.get("file"):
+            uid = sub.get("id") or sub.get("user_id")
+            if uid is not None:
+                existing_ids.add(str(uid))
+            sis = sub.get("sis_id")
+            if sis:
+                existing_sis_ids.add(str(sis))
+
+    def _already_filed(canvas_sub: dict) -> bool:
+        user = canvas_sub.get("user") or {}
+        for id_val in (canvas_sub.get("user_id"), user.get("id")):
+            if id_val is not None and str(id_val) in existing_ids:
+                return True
+        sis = str(user.get("sis_user_id") or canvas_sub.get("sis_user_id") or "")
+        return bool(sis and sis in existing_sis_ids)
+
+    # Fetch all Canvas submissions; keep only those that:
+    #   1. are not already filed in the TOML, and
+    #   2. actually have an attachment (student has submitted something).
+    all_subs = course.get_submissions(assignment_id)
+    new_subs = [
+        sub for sub in all_subs
+        if not _already_filed(sub) and sub.get("attachments")
+    ]
+
+    if not new_subs:
+        print("No new submissions found.")
+        return 0
+
+    print(f"Found {len(new_subs)} new submission(s).")
+
+    download_pdfs = (
+        input("Download PDF submissions? [Y/n]: ").strip().lower()
+        not in {"n", "no"}
+    )
+
+    title = data.get("title") or input_path.stem
+    submissions_dir = input_path.parent / f"{input_path.stem}_submissions"
+    file_map: dict[str, str] = {}
+    skip_existing = not args.force_download_pdfs
+
+    if download_pdfs:
+        downloaded_count = 0
+        existing_count = 0
+        for sub in new_subs:
+            attachments = sub.get("attachments") or []
+            user = sub.get("user") or {}
+            student_id = sub.get("user_id") or sub.get("id") or user.get("id")
+            for att in attachments:
+                fname = att.get("filename") or att.get("display_name")
+                if not fname or not fname.lower().endswith(".pdf"):
+                    continue
+                url = att.get("url") or att.get("download_url") or att.get("href")
+                if not url:
+                    continue
+                sid_part = _safe_filename(str(student_id)) if student_id else "unknown"
+                safe_fname = f"{_safe_filename(title)}_{sid_part}.pdf"
+                dest = submissions_dir / safe_fname
+                if skip_existing and dest.exists():
+                    existing_count += 1
+                    file_map[str(student_id or "")] = dest.name
+                    break
+                try:
+                    course.download_file(url, dest)
+                    file_map[str(student_id or "")] = dest.name
+                    downloaded_count += 1
+                    break
+                except Exception as exc:  # pragma: no cover
+                    print(f"Failed to download {fname}: {exc}")
+        print(f"PDFs: downloaded {downloaded_count}, skipped existing {existing_count}")
+
+    # Sort to match the original download ordering.
+    def _sort_key(sub):
+        user = sub.get("user") or {}
+        name = sub.get("name") or user.get("name") or ""
+        uid = str(sub.get("user_id") or sub.get("id") or "")
+        return (uid,) if anon else (name.lower(), uid)
+
+    new_subs_sorted = sorted(new_subs, key=_sort_key)
+
+    # Build TOML blocks for each new submission.
+    new_blocks: list[str] = []
+    for sub in new_subs_sorted:
+        uid = str(sub.get("user_id") or sub.get("id") or "")
+        file_rel = None
+        if uid and uid in file_map:
+            file_rel = f"{submissions_dir.name}/{file_map[uid]}"
+        submitted_at = sub.get("submitted_at")
+        days_late = None
+        if submitted_at and due_at_dt:
+            try:
+                submitted_dt = dt.datetime.fromisoformat(
+                    str(submitted_at).replace("Z", "+00:00")
+                )
+                dl = round((submitted_dt - due_at_dt).total_seconds() / 86400, 2)
+                if dl > 0:
+                    days_late = dl
+            except Exception:
+                pass
+        new_blocks.append(
+            _submission_block(
+                sub,
+                file_rel=file_rel,
+                score=None,
+                comment=None,
+                anon=anon,
+                submitted_at=submitted_at,
+                days_late=days_late,
+            )
+        )
+
+    # Splice new blocks before the first existing [[submission]] in the raw file.
+    raw = input_path.read_text(encoding="utf-8")
+    marker = "\n[[submission]]"
+    idx = raw.find(marker)
+    if idx == -1:
+        updated = raw.rstrip() + "\n" + "\n".join(new_blocks) + "\n"
+    else:
+        updated = raw[:idx] + "\n".join(new_blocks) + raw[idx:]
+
+    input_path.write_text(updated, encoding="utf-8")
+    print(f"Prepended {len(new_subs_sorted)} submission(s) to {input_path}")
     return 0
 
 
