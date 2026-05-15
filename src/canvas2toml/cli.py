@@ -435,7 +435,7 @@ def _append_backup_submission(path: Path, submission: dict, previous: dict) -> N
 
 
 def _compute_late_deduction(
-    data: dict, submission: dict
+    data: dict, submission: dict, actual_score: float
 ) -> tuple[float, str] | tuple[None, None]:
     """Return (deduction_points, comment_suffix) if a late penalty applies, else (None, None).
 
@@ -444,7 +444,7 @@ def _compute_late_deduction(
 
     - ``days_late`` is rounded to the nearest 0.1 days before the calculation.
     - Days used in the calculation are capped at ``max_days_late``.
-    - The deduction is expressed as a fraction of ``points_possible`` and
+    - The deduction is expressed as a fraction of ``actual_score`` and
       rounded to the nearest 0.1 points.
     """
     max_days_late = _to_float(data.get("max_days_late"))
@@ -462,11 +462,7 @@ def _compute_late_deduction(
 
     deduction_pct = days_used * deduction_pct_per_day
 
-    points_possible = _to_float(data.get("points_possible"))
-    if points_possible is None or points_possible <= 0:
-        return None, None
-
-    deduction_points = round(points_possible * deduction_pct / 100, 1)
+    deduction_points = round(actual_score * deduction_pct / 100, 1)
 
     comment_suffix = (
         f"\n\n*Late penalty: {days_late} day(s) "
@@ -555,12 +551,14 @@ def cmd_upload(args: argparse.Namespace) -> int:
             continue
 
         # Apply late deduction (does not modify the source TOML).
-        deduction_points, deduction_suffix = _compute_late_deduction(data, submission)
         upload_score = score
-        if deduction_points is not None and score is not None:
-            score_f = _to_float(score)
-            if score_f is not None:
+        score_f = _to_float(score)
+        if score_f is not None:
+            deduction_points, deduction_suffix = _compute_late_deduction(data, submission, score_f)
+            if deduction_points is not None:
                 upload_score = round(max(0.0, score_f - deduction_points), 1)
+        else:
+            deduction_points, deduction_suffix = None, None
         upload_comment = comment
         if deduction_suffix is not None:
             upload_comment = (comment or "").rstrip() + deduction_suffix
@@ -770,12 +768,14 @@ def cmd_report(args: argparse.Namespace) -> int:
         comment_raw = sub.get("comment", sub.get("comments"))
 
         # Apply late deduction (does not modify the source TOML).
-        deduction_points, deduction_suffix = _compute_late_deduction(data, sub)
         display_score = score
-        if deduction_points is not None and score is not None:
-            score_f = _to_float(score)
-            if score_f is not None:
+        score_f = _to_float(score)
+        if score_f is not None:
+            deduction_points, deduction_suffix = _compute_late_deduction(data, sub, score_f)
+            if deduction_points is not None:
                 display_score = round(max(0.0, score_f - deduction_points), 1)
+        else:
+            deduction_points, deduction_suffix = None, None
         display_comment = comment_raw
         if deduction_suffix is not None:
             display_comment = (comment_raw or "").rstrip() + deduction_suffix
